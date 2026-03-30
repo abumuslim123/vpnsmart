@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import functools
 import logging
 import os
 import uuid as uuid_lib
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -22,6 +24,7 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 RUSSIA_IP = os.environ["RUSSIA_IP"]
 REALITY_PUBLIC_KEY = os.environ["REALITY_PUBLIC_KEY"]
 REALITY_SHORT_ID = os.environ["REALITY_SHORT_ID"]
+SUB_PORT = int(os.getenv("SUB_PORT", "8080"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vpnsmart-bot")
@@ -326,9 +329,11 @@ async def _add_client(message: Message, name: str, note: str):
         short_id=REALITY_SHORT_ID,
     )
 
+    sub_url = f"http://{RUSSIA_IP}:{SUB_PORT}/sub/{client_uuid}"
     await message.answer(
         f"✅ Added: <b>{name}</b>\n\n"
-        f"<code>{vless}</code>\n\n{status}",
+        f"VLESS:\n<code>{vless}</code>\n\n"
+        f"Subscription:\n<code>{sub_url}</code>\n\n{status}",
         parse_mode="HTML",
         reply_markup=main_menu_kb(),
     )
@@ -383,12 +388,77 @@ async def _show_info(message: Message, name: str):
         reality_public_key=REALITY_PUBLIC_KEY,
         short_id=REALITY_SHORT_ID,
     )
+    sub_url = f"http://{RUSSIA_IP}:{SUB_PORT}/sub/{client['uuid']}"
     await message.answer(
         f"Name: <b>{client['name']}</b>\n"
         f"UUID: <code>{client['uuid']}</code>\n"
         f"Note: {client['note'] or '—'}\n"
         f"Created: {client['created_at']}\n\n"
-        f"VLESS:\n<code>{vless}</code>",
+        f"VLESS:\n<code>{vless}</code>\n\n"
+        f"Subscription:\n<code>{sub_url}</code>",
+        parse_mode="HTML",
+    )
+
+
+# --- Subscription HTTP server ---
+
+
+async def handle_subscription(request: web.Request) -> web.Response:
+    """Serve VLESS subscription for client apps (Hiddify, v2rayNG, etc.)."""
+    token = request.match_info.get("token", "")
+    client = await db.get_client_by_uuid(token)
+    if not client:
+        return web.Response(status=404, text="Not found")
+
+    vless = generate_vless_link(
+        uuid=client["uuid"],
+        name=client["name"],
+        server_ip=RUSSIA_IP,
+        reality_public_key=REALITY_PUBLIC_KEY,
+        short_id=REALITY_SHORT_ID,
+    )
+    encoded = base64.b64encode(vless.encode()).decode()
+    return web.Response(
+        text=encoded,
+        content_type="text/plain",
+        headers={
+            "subscription-userinfo": f"upload=0; download=0",
+            "profile-update-interval": "6",
+            "content-disposition": f'attachment; filename="{client["name"]}.txt"',
+        },
+    )
+
+
+async def start_sub_server():
+    """Start subscription HTTP server."""
+    app = web.Application()
+    app.router.add_get("/sub/{token}", handle_subscription)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", SUB_PORT)
+    await site.start()
+    logger.info(f"Subscription server started on port {SUB_PORT}")
+
+
+# --- Commands: /sub ---
+
+
+@router.message(Command("sub"))
+@admin_only
+async def cmd_sub(message: Message, **kwargs):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Usage: /sub <name>")
+        return
+    client = await db.get_client(parts[1])
+    if not client:
+        await message.answer(f"Client '{parts[1]}' not found.")
+        return
+    sub_url = f"http://{RUSSIA_IP}:{SUB_PORT}/sub/{client['uuid']}"
+    await message.answer(
+        f"<b>{client['name']}</b>\n\n"
+        f"Subscription URL:\n<code>{sub_url}</code>\n\n"
+        f"Import this URL into Hiddify / v2rayNG / Streisand for auto-updates.",
         parse_mode="HTML",
     )
 
@@ -396,11 +466,15 @@ async def _show_info(message: Message, name: str):
 async def main():
     await db.init_db()
 
+    # Start subscription HTTP server
+    await start_sub_server()
+
     await bot.set_my_commands([
         BotCommand(command="start", description="Main menu"),
         BotCommand(command="add", description="Add client: /add name [note]"),
         BotCommand(command="list", description="List clients"),
         BotCommand(command="link", description="Get VLESS link: /link name"),
+        BotCommand(command="sub", description="Subscription URL: /sub name"),
         BotCommand(command="info", description="Client info: /info name"),
         BotCommand(command="note", description="Set note: /note name text"),
     ])

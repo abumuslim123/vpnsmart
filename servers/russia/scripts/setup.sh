@@ -100,8 +100,9 @@ if command -v ufw &> /dev/null; then
     ufw allow 22/tcp > /dev/null 2>&1
     ufw allow 443/tcp > /dev/null 2>&1
     ufw allow 443/udp > /dev/null 2>&1
+    ufw allow 8080/tcp > /dev/null 2>&1
     ufw --force enable > /dev/null 2>&1
-    ok "UFW configured (22/tcp, 443/tcp+udp)"
+    ok "UFW configured (22/tcp, 443/tcp+udp, 8080/tcp)"
 else
     info "UFW not found, skipping firewall setup"
 fi
@@ -137,11 +138,19 @@ ok "Geodata downloaded"
 # ─── Cron for geodata updates ───
 
 CRON_SCRIPT="/opt/vpnsmart/scripts/update-geodata.sh"
+MONITOR_SCRIPT="/opt/vpnsmart/scripts/monitor.sh"
+chmod +x /opt/vpnsmart/scripts/*.sh 2>/dev/null || true
+
+CRON_JOBS=""
 if [ -f "$CRON_SCRIPT" ]; then
-    chmod +x "$CRON_SCRIPT"
-    CRON_LINE="0 */6 * * * $CRON_SCRIPT"
-    (crontab -l 2>/dev/null | grep -v update-geodata; echo "$CRON_LINE") | crontab -
-    ok "Cron job set: geodata updates every 6 hours"
+    CRON_JOBS+="0 */6 * * * $CRON_SCRIPT\n"
+fi
+if [ -f "$MONITOR_SCRIPT" ]; then
+    CRON_JOBS+="*/5 * * * * $MONITOR_SCRIPT\n"
+fi
+if [ -n "$CRON_JOBS" ]; then
+    (crontab -l 2>/dev/null | grep -v update-geodata | grep -v monitor; echo -e "$CRON_JOBS") | crontab -
+    ok "Cron: geodata every 6h, monitor every 5min"
 fi
 
 # ─── Done ───

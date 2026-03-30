@@ -19,6 +19,8 @@ services:
     build: ./bot
     container_name: vpnsmart-bot
     env_file: .env.bot
+    ports:
+      - "8080:8080"
     volumes:
       - ./xray/config.json:/opt/vpnsmart/xray/config.json
       - bot-data:/data

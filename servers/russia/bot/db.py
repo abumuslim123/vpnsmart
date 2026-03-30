@@ -69,6 +69,16 @@ async def update_note(name: str, note: str) -> bool:
         return cursor.rowcount > 0
 
 
+async def get_client_by_uuid(uuid: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM clients WHERE uuid = ?", (uuid,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
 async def get_all_uuids() -> list[dict]:
     """Return all clients with name and uuid for Xray config generation."""
     async with aiosqlite.connect(DB_PATH) as db:
