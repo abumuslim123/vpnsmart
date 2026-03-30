@@ -486,6 +486,21 @@ EOF
 info "Starting containers..."
 ssh $SSH_OPTS "$ENTRY_SSH_USER@$ENTRY_IP" "cd /opt/vpnsmart && docker compose down 2>/dev/null; docker compose up -d --build"
 
+info "Registering first client in bot database..."
+sleep 3
+ssh $SSH_OPTS "$ENTRY_SSH_USER@$ENTRY_IP" "docker exec vpnsmart-bot python3 -c \"
+import sqlite3
+conn = sqlite3.connect('/data/vpnsmart.db')
+conn.execute('CREATE TABLE IF NOT EXISTS clients (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, uuid TEXT UNIQUE NOT NULL, note TEXT DEFAULT \\'\\', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
+try:
+    conn.execute('INSERT INTO clients (name, uuid, note) VALUES (?, ?, ?)', ('client1', '$CLIENT_UUID', 'Initial deploy client'))
+    conn.commit()
+    print('client1 registered in bot DB')
+except Exception:
+    print('client1 already in DB')
+conn.close()
+\""
+
 ok "Entry server deployed"
 
 # ─── Step 7: Verify tunnel ───
