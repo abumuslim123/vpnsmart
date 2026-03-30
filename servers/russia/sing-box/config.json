@@ -1,0 +1,134 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-google",
+        "address": "tls://8.8.8.8",
+        "detour": "direct"
+      },
+      {
+        "tag": "dns-google-proxy",
+        "address": "tls://8.8.8.8",
+        "detour": "wg-finland"
+      },
+      {
+        "tag": "dns-local",
+        "address": "local",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "dns-local"
+      },
+      {
+        "rule_set": "antizapret",
+        "server": "dns-google-proxy"
+      }
+    ],
+    "final": "dns-google"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "name": "client1",
+          "uuid": "${CLIENT_UUID}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.microsoft.com",
+            "server_port": 443
+          },
+          "private_key": "${REALITY_PRIVATE_KEY}",
+          "short_id": [
+            "${REALITY_SHORT_ID}"
+          ],
+          "max_time_difference": "1m"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "wireguard",
+      "tag": "wg-finland",
+      "server": "${FINLAND_IP}",
+      "server_port": 51820,
+      "local_address": [
+        "10.10.0.1/24"
+      ],
+      "private_key": "${RUSSIA_WG_PRIVATE_KEY}",
+      "peer_public_key": "${FINLAND_WG_PUBLIC_KEY}",
+      "pre_shared_key": "${WG_PRESHARED_KEY}",
+      "mtu": 1280
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "dns-out"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geoip-ru",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "antizapret",
+        "outbound": "wg-finland"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "antizapret",
+        "format": "binary",
+        "url": "https://github.com/savely-krasovsky/antizapret-sing-box/releases/latest/download/antizapret.srs",
+        "download_detour": "direct",
+        "update_interval": "6h"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+        "download_detour": "direct",
+        "update_interval": "24h"
+      }
+    ],
+    "final": "direct",
+    "auto_detect_interface": true
+  }
+}
