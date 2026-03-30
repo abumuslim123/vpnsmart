@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # VPNSmart — One-click deployment
-# Deploys the full VPN stack to both servers
+# Deploys: Xray + AmneziaWG on Russia, AmneziaWG exit node on Latvia
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,28 +24,18 @@ ask()    { echo -en "${CYAN}? $1: ${NC}"; }
 header "Checking local dependencies"
 
 MISSING=()
-for cmd in ssh rsync jq wg; do
+for cmd in ssh rsync jq wg curl; do
     if ! command -v "$cmd" &> /dev/null; then
         MISSING+=("$cmd")
     fi
 done
 
-# sing-box is optional locally — we can generate UUID with uuidgen
-HAS_SINGBOX=false
-if command -v sing-box &> /dev/null; then
-    HAS_SINGBOX=true
-fi
-
 if [ ${#MISSING[@]} -gt 0 ]; then
     err "Missing required tools: ${MISSING[*]}"
     echo "Install them:"
-    echo "  macOS:  brew install wireguard-tools jq"
-    echo "  Linux:  apt install wireguard-tools jq"
+    echo "  macOS:  brew install wireguard-tools jq curl"
+    echo "  Linux:  apt install wireguard-tools jq curl"
     exit 1
-fi
-
-if [ "$HAS_SINGBOX" = false ]; then
-    info "sing-box not found locally — will use uuidgen for UUID and generate Reality keys on the server"
 fi
 
 ok "All dependencies present"
@@ -64,29 +54,35 @@ if [ -z "${RUSSIA_IP:-}" ]; then
     read -r RUSSIA_IP
 fi
 
-if [ -z "${FINLAND_IP:-}" ]; then
-    ask "Finland server IP"
-    read -r FINLAND_IP
+if [ -z "${LATVIA_IP:-}" ]; then
+    ask "Latvia server IP"
+    read -r LATVIA_IP
 fi
 
 RUSSIA_SSH_USER="${RUSSIA_SSH_USER:-root}"
-FINLAND_SSH_USER="${FINLAND_SSH_USER:-root}"
+LATVIA_SSH_USER="${LATVIA_SSH_USER:-root}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_vpnsmart}"
+
+SSH_OPTS="-o ConnectTimeout=10 -o BatchMode=yes"
+if [ -f "$SSH_KEY" ]; then
+    SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
+fi
 
 echo ""
 info "Russia:  $RUSSIA_SSH_USER@$RUSSIA_IP"
-info "Finland: $FINLAND_SSH_USER@$FINLAND_IP"
+info "Latvia:  $LATVIA_SSH_USER@$LATVIA_IP"
 
 # ─── Step 2: Test SSH connectivity ───
 
 header "Testing SSH connectivity"
 
-for target in "$RUSSIA_SSH_USER@$RUSSIA_IP" "$FINLAND_SSH_USER@$FINLAND_IP"; do
-    if ssh -o ConnectTimeout=10 -o BatchMode=yes "$target" "echo ok" &> /dev/null; then
+for target in "$RUSSIA_SSH_USER@$RUSSIA_IP" "$LATVIA_SSH_USER@$LATVIA_IP"; do
+    if ssh $SSH_OPTS "$target" "echo ok" &> /dev/null; then
         ok "SSH to $target"
     else
         err "Cannot SSH to $target"
         echo "Make sure:"
-        echo "  1. SSH key is added: ssh-copy-id $target"
+        echo "  1. SSH key is added: ssh-copy-id -i $SSH_KEY $target"
         echo "  2. Server is reachable: ping ${target#*@}"
         exit 1
     fi
@@ -96,67 +92,75 @@ done
 
 header "Generating cryptographic keys"
 
-info "WireGuard keypair (Russia)..."
-RUSSIA_WG_PRIVATE=$(wg genkey)
-RUSSIA_WG_PUBLIC=$(echo "$RUSSIA_WG_PRIVATE" | wg pubkey)
+info "AmneziaWG keypair (Russia)..."
+RUSSIA_AWG_PRIVATE=$(wg genkey)
+RUSSIA_AWG_PUBLIC=$(echo "$RUSSIA_AWG_PRIVATE" | wg pubkey)
 
-info "WireGuard keypair (Finland)..."
-FINLAND_WG_PRIVATE=$(wg genkey)
-FINLAND_WG_PUBLIC=$(echo "$FINLAND_WG_PRIVATE" | wg pubkey)
+info "AmneziaWG keypair (Latvia)..."
+LATVIA_AWG_PRIVATE=$(wg genkey)
+LATVIA_AWG_PUBLIC=$(echo "$LATVIA_AWG_PRIVATE" | wg pubkey)
 
-info "WireGuard preshared key..."
-WG_PSK=$(wg genpsk)
+info "AmneziaWG preshared key..."
+AWG_PSK=$(wg genpsk)
+
+info "AmneziaWG obfuscation parameters..."
+AWG_JC=$((RANDOM % 5 + 4))
+AWG_JMIN=$((RANDOM % 30 + 50))
+AWG_JMAX=$((RANDOM % 700 + 800))
+AWG_S1=$((RANDOM * RANDOM))
+AWG_S2=$((RANDOM * RANDOM))
+AWG_H1=$((RANDOM * RANDOM))
+AWG_H2=$((RANDOM * RANDOM))
+AWG_H3=$((RANDOM * RANDOM))
+AWG_H4=$((RANDOM * RANDOM))
 
 info "VLESS client UUID..."
-if [ "$HAS_SINGBOX" = true ]; then
-    CLIENT_UUID=$(sing-box generate uuid)
-else
-    CLIENT_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
-fi
+CLIENT_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 
-info "Reality keypair..."
-if [ "$HAS_SINGBOX" = true ]; then
-    REALITY_OUTPUT=$(sing-box generate reality-keypair)
-    REALITY_PRIVATE=$(echo "$REALITY_OUTPUT" | grep -i private | awk '{print $NF}')
-    REALITY_PUBLIC=$(echo "$REALITY_OUTPUT" | grep -i public | awk '{print $NF}')
-else
-    info "Generating Reality keypair on Russia server..."
-    # Install sing-box on Russia server temporarily for key generation
-    REALITY_OUTPUT=$(ssh "$RUSSIA_SSH_USER@$RUSSIA_IP" "
-        if ! command -v sing-box &> /dev/null; then
-            bash <(curl -fsSL https://sing-box.app/deb-install.sh) 2>/dev/null || {
-                curl -Lo /tmp/sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-\$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d'\"' -f4 | sed 's/v//')-linux-amd64.tar.gz 2>/dev/null
-                tar -xzf /tmp/sing-box.tar.gz -C /tmp/
-                cp /tmp/sing-box-*/sing-box /usr/local/bin/
-                rm -rf /tmp/sing-box*
-            }
-        fi
-        sing-box generate reality-keypair
-    ")
-    REALITY_PRIVATE=$(echo "$REALITY_OUTPUT" | grep -i private | awk '{print $NF}')
-    REALITY_PUBLIC=$(echo "$REALITY_OUTPUT" | grep -i public | awk '{print $NF}')
-fi
+info "Reality keypair (generating on Russia server)..."
+REALITY_OUTPUT=$(ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "
+    if command -v docker &> /dev/null; then
+        docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>/dev/null
+    else
+        curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
+        systemctl enable docker > /dev/null 2>&1
+        systemctl start docker > /dev/null 2>&1
+        docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>/dev/null
+    fi
+")
+REALITY_PRIVATE=$(echo "$REALITY_OUTPUT" | grep -i "private" | awk '{print $NF}')
+REALITY_PUBLIC=$(echo "$REALITY_OUTPUT" | grep -i "public" | awk '{print $NF}')
 
 info "Reality short ID..."
 SHORT_ID=$(openssl rand -hex 8)
 
 ok "All keys generated"
 
-# Save to .env for reference
+# Save to .env
 cat > "$ENV_FILE" << EOF
 # VPNSmart keys — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # DO NOT commit this file!
 
 RUSSIA_IP=$RUSSIA_IP
-FINLAND_IP=$FINLAND_IP
+LATVIA_IP=$LATVIA_IP
 RUSSIA_SSH_USER=$RUSSIA_SSH_USER
-FINLAND_SSH_USER=$FINLAND_SSH_USER
+LATVIA_SSH_USER=$LATVIA_SSH_USER
 
-RUSSIA_WG_PRIVATE_KEY=$RUSSIA_WG_PRIVATE
-RUSSIA_WG_PUBLIC_KEY=$RUSSIA_WG_PUBLIC
-FINLAND_WG_PRIVATE_KEY=$FINLAND_WG_PRIVATE
-FINLAND_WG_PUBLIC_KEY=$FINLAND_WG_PUBLIC
-WG_PRESHARED_KEY=$WG_PSK
+RUSSIA_AWG_PRIVATE_KEY=$RUSSIA_AWG_PRIVATE
+RUSSIA_AWG_PUBLIC_KEY=$RUSSIA_AWG_PUBLIC
+LATVIA_AWG_PRIVATE_KEY=$LATVIA_AWG_PRIVATE
+LATVIA_AWG_PUBLIC_KEY=$LATVIA_AWG_PUBLIC
+AWG_PRESHARED_KEY=$AWG_PSK
+
+AWG_JC=$AWG_JC
+AWG_JMIN=$AWG_JMIN
+AWG_JMAX=$AWG_JMAX
+AWG_S1=$AWG_S1
+AWG_S2=$AWG_S2
+AWG_H1=$AWG_H1
+AWG_H2=$AWG_H2
+AWG_H3=$AWG_H3
+AWG_H4=$AWG_H4
 
 REALITY_PRIVATE_KEY=$REALITY_PRIVATE
 REALITY_PUBLIC_KEY=$REALITY_PUBLIC
@@ -171,12 +175,22 @@ ok "Keys saved to .env (git-ignored)"
 
 header "Preparing configurations"
 
-# Finland WireGuard config
-FINLAND_WG_CONF=$(cat << EOF
+# Latvia AmneziaWG config
+LATVIA_AWG_CONF=$(cat << EOF
 [Interface]
-PrivateKey = $FINLAND_WG_PRIVATE
+PrivateKey = $LATVIA_AWG_PRIVATE
 Address = 10.10.0.2/24
 ListenPort = 51820
+
+Jc = $AWG_JC
+Jmin = $AWG_JMIN
+Jmax = $AWG_JMAX
+S1 = $AWG_S1
+S2 = $AWG_S2
+H1 = $AWG_H1
+H2 = $AWG_H2
+H3 = $AWG_H3
+H4 = $AWG_H4
 
 PostUp = iptables -t nat -A POSTROUTING -o \$(ip route show default | awk '{print \$5}') -j MASQUERADE
 PostUp = ip6tables -t nat -A POSTROUTING -o \$(ip route show default | awk '{print \$5}') -j MASQUERADE
@@ -184,165 +198,125 @@ PostDown = iptables -t nat -D POSTROUTING -o \$(ip route show default | awk '{pr
 PostDown = ip6tables -t nat -D POSTROUTING -o \$(ip route show default | awk '{print \$5}') -j MASQUERADE
 
 [Peer]
-PublicKey = $RUSSIA_WG_PUBLIC
-PresharedKey = $WG_PSK
+PublicKey = $RUSSIA_AWG_PUBLIC
+PresharedKey = $AWG_PSK
 AllowedIPs = 10.10.0.1/32
 EOF
 )
 
-# Russia sing-box config — build with jq for correctness
-RUSSIA_SINGBOX_CONF=$(jq -n \
+# Russia AmneziaWG config
+RUSSIA_AWG_CONF=$(cat << EOF
+[Interface]
+PrivateKey = $RUSSIA_AWG_PRIVATE
+Address = 10.10.0.1/24
+
+Jc = $AWG_JC
+Jmin = $AWG_JMIN
+Jmax = $AWG_JMAX
+S1 = $AWG_S1
+S2 = $AWG_S2
+H1 = $AWG_H1
+H2 = $AWG_H2
+H3 = $AWG_H3
+H4 = $AWG_H4
+
+PostUp = ip rule add fwmark 1 table 100
+PostUp = ip route add default dev awg0 table 100
+PostDown = ip rule del fwmark 1 table 100
+PostDown = ip route del default dev awg0 table 100
+
+[Peer]
+PublicKey = $LATVIA_AWG_PUBLIC
+PresharedKey = $AWG_PSK
+Endpoint = $LATVIA_IP:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+)
+
+# Russia Xray config — build with jq
+RUSSIA_XRAY_CONF=$(jq -n \
     --arg client_uuid "$CLIENT_UUID" \
     --arg reality_private "$REALITY_PRIVATE" \
     --arg short_id "$SHORT_ID" \
-    --arg finland_ip "$FINLAND_IP" \
-    --arg ru_wg_private "$RUSSIA_WG_PRIVATE" \
-    --arg fi_wg_public "$FINLAND_WG_PUBLIC" \
-    --arg wg_psk "$WG_PSK" \
 '{
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
+  "log": { "loglevel": "warning" },
+  "api": { "tag": "api", "services": ["HandlerService", "StatsService"] },
   "dns": {
+    "hosts": {
+      "cloudflare-dns.com": ["1.1.1.1", "1.0.0.1"],
+      "common.dot.dns.yandex.net": ["77.88.8.8", "77.88.8.1"]
+    },
     "servers": [
-      {
-        "tag": "dns-google",
-        "address": "tls://8.8.8.8",
-        "detour": "direct"
-      },
-      {
-        "tag": "dns-google-proxy",
-        "address": "tls://8.8.8.8",
-        "detour": "wg-finland"
-      },
-      {
-        "tag": "dns-local",
-        "address": "local",
-        "detour": "direct"
-      }
+      { "address": "https://cloudflare-dns.com/dns-query", "domains": ["ext:geosite_RU.dat:ru-blocked"], "queryStrategy": "UseIPv4", "skipFallback": true },
+      { "address": "https+local://common.dot.dns.yandex.net/dns-query", "queryStrategy": "UseIPv4" }
     ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-local"
-      },
-      {
-        "rule_set": "antizapret",
-        "server": "dns-google-proxy"
-      }
-    ],
-    "final": "dns-google"
+    "queryStrategy": "UseIPv4",
+    "disableFallbackIfMatch": false,
+    "tag": "dns"
   },
+  "stats": {},
   "inbounds": [
+    { "tag": "api", "listen": "127.0.0.1", "port": 62789, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" } },
     {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": 443,
-      "users": [
-        {
-          "name": "client1",
-          "uuid": $client_uuid,
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.microsoft.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "www.microsoft.com",
-            "server_port": 443
-          },
-          "private_key": $reality_private,
-          "short_id": [$short_id],
-          "max_time_difference": "1m"
-        }
-      }
+      "tag": "vless-in", "listen": "0.0.0.0", "port": 443, "protocol": "vless",
+      "settings": { "clients": [{ "email": "client1", "id": $client_uuid, "flow": "xtls-rprx-vision" }], "decryption": "none" },
+      "streamSettings": {
+        "network": "tcp", "security": "reality",
+        "realitySettings": { "show": false, "dest": "ya.ru:443", "xver": 0, "serverNames": ["ya.ru"], "privateKey": $reality_private, "shortIds": [$short_id] }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false, "routeOnly": true }
     }
   ],
   "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "wireguard",
-      "tag": "wg-finland",
-      "server": $finland_ip,
-      "server_port": 51820,
-      "local_address": ["10.10.0.1/24"],
-      "private_key": $ru_wg_private,
-      "peer_public_key": $fi_wg_public,
-      "pre_shared_key": $wg_psk,
-      "mtu": 1280
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    },
-    {
-      "type": "dns",
-      "tag": "dns-out"
-    }
+    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } },
+    { "tag": "awg", "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" }, "streamSettings": { "sockopt": { "mark": 1 } } },
+    { "tag": "blocked", "protocol": "blackhole", "settings": {} }
   ],
-  "route": {
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {"protocol": "dns", "outbound": "dns-out"},
-      {"ip_is_private": true, "outbound": "direct"},
-      {"rule_set": "geoip-ru", "outbound": "direct"},
-      {"rule_set": "antizapret", "outbound": "wg-finland"}
-    ],
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "antizapret",
-        "format": "binary",
-        "url": "https://github.com/savely-krasovsky/antizapret-sing-box/releases/latest/download/antizapret.srs",
-        "download_detour": "direct",
-        "update_interval": "6h"
-      },
-      {
-        "type": "remote",
-        "tag": "geoip-ru",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
-        "download_detour": "direct",
-        "update_interval": "24h"
-      }
-    ],
-    "final": "direct",
-    "auto_detect_interface": true
-  }
+      { "type": "field", "inboundTag": ["api"], "outboundTag": "api" },
+      { "type": "field", "inboundTag": ["dns"], "outboundTag": "awg" },
+      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked" },
+      { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
+      { "type": "field", "domain": ["ext:geosite_RU.dat:ru-blocked"], "outboundTag": "awg" },
+      { "type": "field", "ip": ["ext:geoip_RU.dat:ru-blocked", "ext:geoip_RU.dat:ru-blocked-community", "ext:geoip_RU.dat:re-filter"], "outboundTag": "awg" },
+      { "type": "field", "network": "tcp,udp", "outboundTag": "direct" }
+    ]
+  },
+  "policy": { "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } }, "system": { "statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true } }
 }')
 
 ok "Configs prepared with actual keys"
 
-# ─── Step 5: Deploy Finland server ───
+# ─── Step 5: Deploy Latvia server ───
 
-header "Deploying Finland server"
+header "Deploying Latvia server"
 
-info "Installing Docker and WireGuard..."
-ssh "$FINLAND_SSH_USER@$FINLAND_IP" << 'REMOTE_SETUP'
+info "Running setup script..."
+ssh $SSH_OPTS "$LATVIA_SSH_USER@$LATVIA_IP" << 'REMOTE_SETUP'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt update -qq
 apt upgrade -y -qq
 
-# Install Docker
-if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker
-    systemctl start docker
+# Install AmneziaWG
+if ! command -v awg &> /dev/null; then
+    apt install -y -qq software-properties-common
+    add-apt-repository -y ppa:amneziavpn/ppa 2>/dev/null || true
+    apt update -qq
+    apt install -y -qq amneziawg amneziawg-tools 2>/dev/null || {
+        apt install -y -qq git golang-go make wireguard-tools
+        cd /tmp && rm -rf amneziawg-go
+        git clone https://github.com/amnezia-vpn/amneziawg-go.git
+        cd amneziawg-go && make && make install
+        cd / && rm -rf /tmp/amneziawg-go
+    }
 fi
 
-# Docker Compose plugin
-if ! docker compose version &> /dev/null; then
-    apt install -y -qq docker-compose-plugin
-fi
+apt install -y -qq wireguard-tools
 
 # sysctl
 cat > /etc/sysctl.d/99-vpnsmart.conf << 'SYSCTL'
@@ -360,28 +334,25 @@ if command -v ufw &> /dev/null; then
     ufw --force enable > /dev/null 2>&1
 fi
 
-mkdir -p /opt/vpnsmart/wireguard
+mkdir -p /etc/amneziawg
 REMOTE_SETUP
 
-ok "Finland: system configured"
+ok "Latvia: system configured"
 
-info "Uploading WireGuard config..."
-echo "$FINLAND_WG_CONF" | ssh "$FINLAND_SSH_USER@$FINLAND_IP" "cat > /opt/vpnsmart/wireguard/wg0.conf && chmod 600 /opt/vpnsmart/wireguard/wg0.conf"
+info "Uploading AmneziaWG config..."
+echo "$LATVIA_AWG_CONF" | ssh $SSH_OPTS "$LATVIA_SSH_USER@$LATVIA_IP" "cat > /etc/amneziawg/awg0.conf && chmod 600 /etc/amneziawg/awg0.conf"
 
-# Upload docker-compose
-cat "$SCRIPT_DIR/servers/finland/docker-compose.yml" | ssh "$FINLAND_SSH_USER@$FINLAND_IP" "cat > /opt/vpnsmart/docker-compose.yml"
+info "Starting AmneziaWG..."
+ssh $SSH_OPTS "$LATVIA_SSH_USER@$LATVIA_IP" "systemctl enable awg-quick@awg0 && systemctl restart awg-quick@awg0"
 
-info "Starting WireGuard container..."
-ssh "$FINLAND_SSH_USER@$FINLAND_IP" "cd /opt/vpnsmart && docker compose down 2>/dev/null; docker compose up -d"
-
-ok "Finland server deployed"
+ok "Latvia server deployed"
 
 # ─── Step 6: Deploy Russia server ───
 
 header "Deploying Russia server"
 
-info "Installing Docker and sing-box..."
-ssh "$RUSSIA_SSH_USER@$RUSSIA_IP" << 'REMOTE_SETUP'
+info "Running setup script..."
+ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" << 'REMOTE_SETUP'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -395,13 +366,27 @@ if ! command -v docker &> /dev/null; then
     systemctl start docker
 fi
 
-# Docker Compose plugin
 if ! docker compose version &> /dev/null; then
     apt install -y -qq docker-compose-plugin
 fi
 
-# Install jq for add-client script
-apt install -y -qq jq
+apt install -y -qq jq curl
+
+# Install AmneziaWG
+if ! command -v awg &> /dev/null; then
+    apt install -y -qq software-properties-common
+    add-apt-repository -y ppa:amneziavpn/ppa 2>/dev/null || true
+    apt update -qq
+    apt install -y -qq amneziawg amneziawg-tools 2>/dev/null || {
+        apt install -y -qq git golang-go make wireguard-tools
+        cd /tmp && rm -rf amneziawg-go
+        git clone https://github.com/amnezia-vpn/amneziawg-go.git
+        cd amneziawg-go && make && make install
+        cd / && rm -rf /tmp/amneziawg-go
+    }
+fi
+
+apt install -y -qq wireguard-tools
 
 # sysctl
 cat > /etc/sysctl.d/99-vpnsmart.conf << 'SYSCTL'
@@ -409,6 +394,8 @@ net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 net.core.rmem_max = 2500000
 net.core.wmem_max = 2500000
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
 SYSCTL
 sysctl --system > /dev/null
 
@@ -420,22 +407,51 @@ if command -v ufw &> /dev/null; then
     ufw --force enable > /dev/null 2>&1
 fi
 
-mkdir -p /opt/vpnsmart/sing-box /opt/vpnsmart/scripts
+mkdir -p /etc/amneziawg /opt/vpnsmart/xray/geodata /opt/vpnsmart/scripts /opt/vpnsmart/bot
+
+# Download geodata
+BASE_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
+curl -sSL -o /opt/vpnsmart/xray/geodata/geosite_RU.dat "$BASE_URL/geosite_RU.dat" || true
+curl -sSL -o /opt/vpnsmart/xray/geodata/geoip_RU.dat "$BASE_URL/geoip_RU.dat" || true
 REMOTE_SETUP
 
 ok "Russia: system configured"
 
-info "Uploading sing-box config..."
-echo "$RUSSIA_SINGBOX_CONF" | ssh "$RUSSIA_SSH_USER@$RUSSIA_IP" "cat > /opt/vpnsmart/sing-box/config.json"
+info "Uploading AmneziaWG config..."
+echo "$RUSSIA_AWG_CONF" | ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "cat > /etc/amneziawg/awg0.conf && chmod 600 /etc/amneziawg/awg0.conf"
 
-# Upload docker-compose
-cat "$SCRIPT_DIR/servers/russia/docker-compose.yml" | ssh "$RUSSIA_SSH_USER@$RUSSIA_IP" "cat > /opt/vpnsmart/docker-compose.yml"
+info "Starting AmneziaWG tunnel..."
+ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "systemctl enable awg-quick@awg0 && systemctl restart awg-quick@awg0 && sysctl -w net.ipv4.conf.awg0.rp_filter=0 > /dev/null 2>&1 || true"
 
-# Upload add-client script
-cat "$SCRIPT_DIR/servers/russia/scripts/add-client.sh" | ssh "$RUSSIA_SSH_USER@$RUSSIA_IP" "cat > /opt/vpnsmart/scripts/add-client.sh && chmod +x /opt/vpnsmart/scripts/add-client.sh"
+info "Uploading Xray config..."
+echo "$RUSSIA_XRAY_CONF" | ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "cat > /opt/vpnsmart/xray/config.json"
 
-info "Starting sing-box container..."
-ssh "$RUSSIA_SSH_USER@$RUSSIA_IP" "cd /opt/vpnsmart && docker compose down 2>/dev/null; docker compose up -d"
+# Upload docker-compose and bot
+info "Uploading project files..."
+rsync -avz --exclude='.git' --exclude='*.dat' --exclude='.env' \
+    "$SCRIPT_DIR/servers/russia/docker-compose.yml" \
+    "$RUSSIA_SSH_USER@$RUSSIA_IP":/opt/vpnsmart/docker-compose.yml
+
+rsync -avz "$SCRIPT_DIR/servers/russia/bot/" "$RUSSIA_SSH_USER@$RUSSIA_IP":/opt/vpnsmart/bot/
+rsync -avz "$SCRIPT_DIR/servers/russia/scripts/" "$RUSSIA_SSH_USER@$RUSSIA_IP":/opt/vpnsmart/scripts/
+
+# Upload update-geodata script and set cron
+ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "chmod +x /opt/vpnsmart/scripts/*.sh && (crontab -l 2>/dev/null | grep -v update-geodata; echo '0 */6 * * * /opt/vpnsmart/scripts/update-geodata.sh') | crontab -"
+
+info "Creating bot .env..."
+ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "cat > /opt/vpnsmart/.env.bot" << EOF
+BOT_TOKEN=${BOT_TOKEN:-CHANGE_ME}
+ADMIN_ID=${ADMIN_ID:-CHANGE_ME}
+RUSSIA_IP=$RUSSIA_IP
+REALITY_PUBLIC_KEY=$REALITY_PUBLIC
+REALITY_SHORT_ID=$SHORT_ID
+XRAY_CONFIG=/opt/vpnsmart/xray/config.json
+XRAY_CONTAINER=vpnsmart-xray-russia
+DB_PATH=/data/vpnsmart.db
+EOF
+
+info "Starting containers..."
+ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "cd /opt/vpnsmart && docker compose down 2>/dev/null; docker compose up -d --build"
 
 ok "Russia server deployed"
 
@@ -443,12 +459,12 @@ ok "Russia server deployed"
 
 header "Verifying tunnel connectivity"
 
-sleep 5  # Wait for containers to initialize
+sleep 5
 
-info "Testing WireGuard tunnel (Russia → Finland)..."
+info "Testing AmneziaWG tunnel (Russia → Latvia)..."
 TUNNEL_OK=false
 for attempt in 1 2 3; do
-    if ssh "$RUSSIA_SSH_USER@$RUSSIA_IP" "docker exec vpnsmart-singbox-russia ping -c 2 -W 3 10.10.0.2" &> /dev/null; then
+    if ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "ping -c 2 -W 3 10.10.0.2" &> /dev/null; then
         TUNNEL_OK=true
         break
     fi
@@ -457,71 +473,29 @@ for attempt in 1 2 3; do
 done
 
 if [ "$TUNNEL_OK" = true ]; then
-    ok "WireGuard tunnel is UP"
+    ok "AmneziaWG tunnel is UP"
 else
-    err "WireGuard tunnel is DOWN — check logs with: make logs-finland / make logs-russia"
+    err "AmneziaWG tunnel is DOWN"
+    echo "Debug:"
+    echo "  Russia: ssh $RUSSIA_SSH_USER@$RUSSIA_IP 'awg show; ip rule show; ip route show table 100'"
+    echo "  Latvia: ssh $LATVIA_SSH_USER@$LATVIA_IP 'awg show'"
 fi
 
-# ─── Step 8: Generate client config ───
+# Verify policy routing
+info "Checking policy routing..."
+ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "ip rule show | grep -q 'fwmark 0x1' && echo 'fwmark rule OK' || echo 'fwmark rule MISSING'"
+ssh $SSH_OPTS "$RUSSIA_SSH_USER@$RUSSIA_IP" "ip route show table 100 | grep -q 'awg0' && echo 'route table 100 OK' || echo 'route table 100 MISSING'"
+
+# ─── Step 8: Generate VLESS link ───
 
 header "Client configuration"
 
-CLIENT_CONFIG=$(cat << EOF
-{
-  "log": {"level": "info"},
-  "dns": {
-    "servers": [
-      {"tag": "proxy-dns", "address": "tls://8.8.8.8", "detour": "proxy"},
-      {"tag": "direct-dns", "address": "local", "detour": "direct"}
-    ],
-    "rules": [{"outbound": "any", "server": "direct-dns"}],
-    "final": "proxy-dns"
-  },
-  "inbounds": [
-    {
-      "type": "tun",
-      "tag": "tun-in",
-      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
-      "auto_route": true,
-      "strict_route": true,
-      "stack": "mixed"
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "vless",
-      "tag": "proxy",
-      "server": "$RUSSIA_IP",
-      "server_port": 443,
-      "uuid": "$CLIENT_UUID",
-      "flow": "xtls-rprx-vision",
-      "tls": {
-        "enabled": true,
-        "server_name": "www.microsoft.com",
-        "utls": {"enabled": true, "fingerprint": "chrome"},
-        "reality": {
-          "enabled": true,
-          "public_key": "$REALITY_PUBLIC",
-          "short_id": "$SHORT_ID"
-        }
-      }
-    },
-    {"type": "direct", "tag": "direct"},
-    {"type": "dns", "tag": "dns-out"}
-  ],
-  "route": {
-    "rules": [{"protocol": "dns", "outbound": "dns-out"}],
-    "final": "proxy",
-    "auto_detect_interface": true
-  }
-}
-EOF
-)
+VLESS_LINK="vless://${CLIENT_UUID}@${RUSSIA_IP}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=ya.ru&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${SHORT_ID}&type=tcp#vpnsmart"
 
-CLIENT_FILE="$SCRIPT_DIR/clients/client1.json"
-echo "$CLIENT_CONFIG" > "$CLIENT_FILE"
-
-ok "Client config saved to clients/client1.json"
+echo "VLESS link (import into v2rayN / Hiddify / sing-box):"
+echo ""
+echo -e "  ${CYAN}${VLESS_LINK}${NC}"
+echo ""
 
 # ─── Done ───
 
@@ -530,23 +504,14 @@ header "DEPLOYMENT COMPLETE"
 echo -e "${GREEN}VPN is ready!${NC}"
 echo ""
 echo "Your servers:"
-echo -e "  Russia:  ${CYAN}$RUSSIA_IP${NC} (sing-box + VLESS + Reality)"
-echo -e "  Finland: ${CYAN}$FINLAND_IP${NC} (WireGuard exit node)"
+echo -e "  Russia: ${CYAN}$RUSSIA_IP${NC} (Xray + VLESS + Reality + AmneziaWG)"
+echo -e "  Latvia: ${CYAN}$LATVIA_IP${NC} (AmneziaWG exit node)"
 echo ""
-echo "Client setup:"
-echo "  1. Install sing-box app:"
-echo "     iOS:     Search 'sing-box' in App Store (SFI)"
-echo "     Android: Search 'sing-box' in Google Play (SFA)"
-echo "     macOS:   Search 'sing-box' in App Store (SFM)"
+echo "Client apps:"
+echo "  v2rayN (Windows), Hiddify (Android/iOS), sing-box (all platforms)"
+echo "  Import the VLESS link above."
 echo ""
-echo "  2. Import config from: ${CYAN}clients/client1.json${NC}"
-echo ""
-echo "  3. Connect and verify:"
-echo "     - vk.com → should show Russian IP"
-echo "     - linkedin.com → should show Finnish IP"
-echo ""
-echo "Add more clients:"
-echo -e "  ${CYAN}./deploy.sh add-client <name>${NC}"
+echo "Manage clients via Telegram bot (set BOT_TOKEN and ADMIN_ID in .env.bot)"
 echo ""
 echo "Keys and credentials saved in: ${CYAN}.env${NC}"
 echo -e "${RED}Do NOT share or commit the .env file!${NC}"

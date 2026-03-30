@@ -1,11 +1,18 @@
 # Secrets
 .env
+.env.*
 *.key
 *.pem
 
 # Generated client configs
 clients/*.json
 !clients/template.json
+
+# Geodata (downloaded during deploy)
+servers/russia/xray/geodata/*.dat
+
+# Bot data
+servers/russia/bot/data/
 
 # OS
 .DS_Store

@@ -90,7 +90,7 @@ CONFIG=$(cat << EOF
       "flow": "xtls-rprx-vision",
       "tls": {
         "enabled": true,
-        "server_name": "www.microsoft.com",
+        "server_name": "ya.ru",
         "utls": {"enabled": true, "fingerprint": "chrome"},
         "reality": {
           "enabled": true,

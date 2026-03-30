@@ -1,223 +1,210 @@
 # VPNSmart
 
-Умный VPN: российские сайты через Россию, заблокированные — через Финляндию. Автоматически.
+Умный VPN: российские сайты через Россию, заблокированные — через Латвию. Автоматически.
 
-## Как это работает
+## Архитектура
 
 ```
-[Клиент] --VLESS+Reality--> [Сервер Россия (sing-box)]
-                                    |
-                    Сайт заблокирован? ──YES──> [WireGuard туннель] --> [Сервер Финляндия] --> Интернет
-                                    |
-                                   NO --> Интернет напрямую (российский IP)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│   📱 Клиент (v2rayN / Hiddify / sing-box)                                   │
+│   ┌─────────────────────────────┐                                            │
+│   │  VLESS + Reality (TLS 1.3)  │                                            │
+│   │  SNI: ya.ru                 │                                            │
+│   │  Fingerprint: Chrome        │                                            │
+│   └─────────────┬───────────────┘                                            │
+│                 │ порт 443 (выглядит как обычный HTTPS)                       │
+│                 │                                                             │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│                 ▼                                                             │
+│   🇷🇺 Россия (91.218.247.244)                                                │
+│   ┌─────────────────────────────────────────────────────────┐                │
+│   │                     Xray-core                           │                │
+│   │  ┌─────────────────────────────────────────────────┐    │                │
+│   │  │              Маршрутизация                       │    │                │
+│   │  │                                                  │    │                │
+│   │  │  geosite_RU.dat:ru-blocked  ─┐                   │    │                │
+│   │  │  geoip_RU.dat:ru-blocked    ─┼── fwmark = 1      │    │                │
+│   │  │  geoip_RU.dat:re-filter     ─┘    │              │    │                │
+│   │  │                                    │              │    │                │
+│   │  │  geoip:private ──── direct         │              │    │                │
+│   │  │  остальное ──────── direct         │              │    │                │
+│   │  │  bittorrent ─────── blocked        │              │    │                │
+│   │  └────────────────────────────────────┼──────────────┘    │                │
+│   └───────────────────────────────────────┼──────────────────┘                │
+│                                           │                                   │
+│              ┌────────────────────────────┘                                   │
+│              │  Linux Policy Routing                                          │
+│              │  ip rule: fwmark 1 → table 100                                │
+│              │  table 100: default dev awg0                                   │
+│              ▼                                                                │
+│   ┌──────────────────────────┐                                               │
+│   │  AmneziaWG (awg0)       │                                                │
+│   │  DPI-устойчивый туннель  │                                                │
+│   │  Обфускация: Jc/Jmin/   │                                                │
+│   │  Jmax/S1/S2/H1-H4       │                                                │
+│   └─────────────┬────────────┘                                               │
+│                 │ UDP :51820 (нераспознаваем для DPI)                         │
+│                 │                                                             │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│                 ▼                                                             │
+│   🇱🇻 Латвия (213.155.12.223)                                                │
+│   ┌──────────────────────────┐                                               │
+│   │  AmneziaWG (awg0)       │                                                │
+│   │  NAT Masquerade         ├──────────▶  🌍 Интернет                        │
+│   │  10.10.0.2/24           │             (YouTube, Instagram,               │
+│   └──────────────────────────┘              Discord, Twitter...)              │
+│                                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   📊 Управление                                                              │
+│   ┌──────────────────────────┐    ┌──────────────────────────────────┐       │
+│   │  Telegram бот            │    │  Geodata (авто-обновление 6ч)    │       │
+│   │  @vlesssmart_bot         │    │  runetfreedom/russia-v2ray-rules │       │
+│   │  /add /list /link /delete│    │  geosite_RU.dat + geoip_RU.dat  │       │
+│   └──────────────────────────┘    └──────────────────────────────────┘       │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Клиент → Россия:** VLESS + Reality (выглядит как обычный HTTPS, не детектируется ТСПУ)
-- **Россия → Финляндия:** WireGuard (server-to-server, не блокируется)
-- **Маршрутизация:** Автоматическая по базе [antizapret](https://github.com/savely-krasovsky/antizapret-sing-box) (700K+ доменов, обновляется каждые 6 часов)
+### Поток трафика
+
+```
+Заблокированный сайт (youtube.com):
+  Клиент → VLESS+Reality(:443) → Xray(fwmark=1) → awg0 → Латвия → Интернет
+
+Российский сайт (ya.ru):
+  Клиент → VLESS+Reality(:443) → Xray(direct) → Интернет напрямую
+
+DNS заблокированных доменов:
+  Cloudflare DoH → через AmneziaWG → без утечек через российских провайдеров
+```
+
+## Стек технологий
+
+| Компонент | Технология | Назначение |
+|-----------|-----------|------------|
+| Прокси | Xray-core + VLESS + Reality | Обход DPI, маскировка под HTTPS к ya.ru |
+| Туннель | AmneziaWG | DPI-устойчивый WireGuard с обфускацией |
+| Маршрутизация | Linux fwmark + policy routing | Раздельный роутинг заблокированного трафика |
+| Блоклисты | geosite_RU / geoip_RU | Автообновляемые списки заблокированных ресурсов |
+| Управление | Telegram бот (aiogram) | Добавление/удаление клиентов |
 
 ## Требования
 
-- 2 VPS сервера: Россия + Финляндия (Ubuntu 22.04+ / Debian 12+)
-- Локально: `wg` (wireguard-tools), `sing-box`, `jq`
+- 2 VPS сервера: Россия + Латвия/Европа (Ubuntu 22.04+)
+- Локально: `wg` (wireguard-tools), `jq`, `curl`
 
-## Быстрый старт (один скрипт)
+## Быстрый старт
 
 ```bash
-# Установить зависимости (macOS)
-brew install wireguard-tools jq
-
-# Запустить развертывание — скрипт сделает всё сам:
-# генерация ключей → настройка Финляндии → настройка России → клиентский конфиг
-./deploy.sh
+brew install wireguard-tools jq   # macOS
+./deploy.sh                        # всё автоматически
 ```
 
-Скрипт спросит IP серверов, проверит SSH-доступ, сгенерирует ключи, развернёт оба сервера и создаст готовый клиентский конфиг в `clients/client1.json`.
+Скрипт спросит IP серверов, сгенерирует ключи, развернёт AmneziaWG + Xray + бота и выдаст VLESS-ссылку.
 
----
-
-## Ручное развертывание (по шагам)
+## Ручное развертывание
 
 ### 1. Генерация ключей
 
 ```bash
-# Установить зависимости (macOS)
-brew install wireguard-tools jq
-
-# Установить sing-box
-# https://sing-box.sagernet.org/installation/from-source/
-
-# Сгенерировать все ключи
-make keys
+make keys   # или: bash servers/russia/scripts/generate-keys.sh
 ```
 
-Сохраните вывод — это все ключи для настройки. Пример вывода:
-
-```
-RUSSIA_WG_PRIVATE_KEY=aAbBcCdD...
-RUSSIA_WG_PUBLIC_KEY=eEfFgGhH...
-FINLAND_WG_PRIVATE_KEY=iIjJkKlL...
-FINLAND_WG_PUBLIC_KEY=mMnNoOpP...
-WG_PRESHARED_KEY=qQrRsStT...
-REALITY_PRIVATE_KEY=uUvVwWxX...
-REALITY_PUBLIC_KEY=yYzZ0011...
-REALITY_SHORT_ID=0123456789abcdef
-CLIENT_UUID=bf000d23-0752-40b4-affe-68f7707a9661
+Reality-ключи генерируются на сервере:
+```bash
+docker run --rm ghcr.io/xtls/xray-core:latest x25519
 ```
 
-### 2. Настройка сервера Финляндии
-
-Отредактируйте `servers/finland/wireguard/wg0.conf` — замените плейсхолдеры:
-
-```
-${FINLAND_WG_PRIVATE_KEY}  → ваш ключ из шага 1
-${RUSSIA_WG_PUBLIC_KEY}    → ваш ключ из шага 1
-${WG_PRESHARED_KEY}        → ваш ключ из шага 1
-```
-
-> **Важно:** Проверьте имя сетевого интерфейса на сервере (`ip a`). Если это не `eth0`, замените `eth0` в `wg0.conf` на правильное имя (например, `ens3`).
-
-Разверните:
+### 2. Развертывание Латвии (exit node)
 
 ```bash
-make deploy-finland FINLAND_IP=<ip-финляндии>
+make deploy-latvia LATVIA_IP=<ip>
 ```
 
-Или вручную:
+### 3. Развертывание России (entry point)
 
 ```bash
-# На сервере Финляндии
-scp -r servers/finland/* root@<ip>:/opt/vpnsmart/
-ssh root@<ip>
-cd /opt/vpnsmart
-chmod +x scripts/setup.sh
-./scripts/setup.sh
-docker compose up -d
+make deploy-russia RUSSIA_IP=<ip>
 ```
 
-### 3. Настройка сервера России
-
-Отредактируйте `servers/russia/sing-box/config.json` — замените плейсхолдеры:
-
-```
-${CLIENT_UUID}           → UUID клиента из шага 1
-${REALITY_PRIVATE_KEY}   → приватный ключ Reality из шага 1
-${REALITY_SHORT_ID}      → Short ID из шага 1
-${FINLAND_IP}            → публичный IP сервера Финляндии
-${RUSSIA_WG_PRIVATE_KEY} → приватный WG ключ России из шага 1
-${FINLAND_WG_PUBLIC_KEY} → публичный WG ключ Финляндии из шага 1
-${WG_PRESHARED_KEY}      → PSK из шага 1
-```
-
-Разверните:
+### 4. Проверка
 
 ```bash
-make deploy-russia RUSSIA_IP=<ip-россии>
+# Туннель
+ssh root@<russia-ip> 'ping -c 2 10.10.0.2'
+
+# Policy routing
+ssh root@<russia-ip> 'ip rule show | grep fwmark'
+
+# Подключение клиентом — импортировать VLESS-ссылку
 ```
 
-### 4. Проверка туннеля
+### 5. Клиентские приложения
 
-```bash
-# SSH на сервер России
-ssh root@<ip-россии>
-# Проверить туннель к Финляндии
-docker exec vpnsmart-singbox-russia ping -c 3 10.10.0.2
-```
+| Платформа | Приложение |
+|-----------|-----------|
+| Windows | [v2rayN](https://github.com/2dust/v2rayN), [Hiddify](https://github.com/hiddify/hiddify-app) |
+| Android | [v2rayNG](https://github.com/2dust/v2rayNG), [Hiddify](https://github.com/hiddify/hiddify-app) |
+| iOS | [Hiddify](https://apps.apple.com/app/hiddify-proxy-vpn/id6596777532), [Streisand](https://apps.apple.com/app/streisand/id6450534064) |
+| macOS | [Hiddify](https://github.com/hiddify/hiddify-app), [V2BOX](https://apps.apple.com/app/v2box-v2ray-client/id6446814690) |
 
-### 5. Настройка клиента
-
-Установите приложение sing-box:
-- **iOS:** [SFI в App Store](https://apps.apple.com/app/sing-box/id6451272673)
-- **Android:** [SFA в Google Play](https://play.google.com/store/apps/details?id=io.nekohasekai.sfa)
-- **macOS:** [SFM в App Store](https://apps.apple.com/app/sing-box/id6673731168)
-- **Windows:** [sing-box releases](https://github.com/SagerNet/sing-box/releases)
-
-Сгенерируйте конфиг:
-
-```bash
-make client-config \
-  SERVER_IP=<ip-россии> \
-  UUID=<uuid-клиента> \
-  PUBLIC_KEY=<reality-public-key> \
-  SHORT_ID=<short-id>
-```
-
-Импортируйте полученный JSON в приложение sing-box.
-
-### 6. Добавление новых клиентов
-
-```bash
-make add-client \
-  NAME=phone-vasya \
-  RUSSIA_IP=<ip-россии> \
-  PUBLIC_KEY=<reality-public-key> \
-  SHORT_ID=<short-id>
-```
-
-Скрипт:
-1. Генерирует новый UUID
-2. Добавляет пользователя в конфиг sing-box
-3. Выводит готовый клиентский конфиг
-
-После добавления перезапустите sing-box:
-
-```bash
-make restart-russia RUSSIA_IP=<ip-россии>
-```
+Импортируйте VLESS-ссылку в приложение.
 
 ## Управление
 
 ```bash
-make status RUSSIA_IP=... FINLAND_IP=...    # Статус обоих серверов
-make logs-russia RUSSIA_IP=...               # Логи Russia
-make logs-finland FINLAND_IP=...             # Логи Finland
-make restart-russia RUSSIA_IP=...            # Перезапуск Russia
-make restart-finland FINLAND_IP=...          # Перезапуск Finland
-make test RUSSIA_IP=... FINLAND_IP=...       # Тесты маршрутизации
-make test-direct                              # Тест прямого доступа
+make status RUSSIA_IP=... LATVIA_IP=...    # Статус серверов
+make logs-russia RUSSIA_IP=...              # Логи Xray + бот
+make logs-latvia LATVIA_IP=...              # Статус AmneziaWG
+make restart-russia RUSSIA_IP=...           # Перезапуск Xray
+make restart-latvia LATVIA_IP=...           # Перезапуск AmneziaWG
+make update-geodata RUSSIA_IP=...           # Обновить блоклисты
 ```
+
+Клиенты управляются через Telegram-бота: `/add`, `/list`, `/link`, `/info`, `/note`, удаление.
 
 ## Структура проекта
 
 ```
 vpnsmart/
 ├── servers/
-│   ├── russia/          # Точка входа VPN (sing-box + VLESS + Reality)
-│   │   ├── sing-box/    # Конфигурация sing-box (маршрутизация + VLESS)
-│   │   ├── scripts/     # Скрипты развертывания и управления
+│   ├── russia/              # Entry point (Xray + AmneziaWG клиент)
+│   │   ├── xray/            # Xray конфиг + geodata
+│   │   ├── amneziawg/       # AWG туннель + policy routing
+│   │   ├── bot/             # Telegram бот (aiogram)
+│   │   ├── scripts/         # setup, generate-keys, update-geodata
 │   │   └── docker-compose.yml
-│   └── finland/         # Выходной узел (WireGuard)
-│       ├── wireguard/   # WireGuard конфигурация
-│       ├── scripts/     # Скрипт установки
-│       └── docker-compose.yml
-├── clients/             # Клиентские конфиги и генератор
-├── tests/               # Тесты маршрутизации
-└── Makefile             # Автоматизация
+│   └── latvia/              # Exit node (AmneziaWG + NAT)
+│       ├── amneziawg/       # AWG сервер
+│       └── scripts/         # setup
+├── clients/                 # Клиентские шаблоны
+├── tests/                   # Тесты маршрутизации
+├── deploy.sh                # One-click деплой
+└── Makefile                 # Автоматизация
 ```
 
-## Как обновляются списки блокировок
+## Обновление блоклистов
 
-sing-box автоматически скачивает обновленные rule-sets каждые 6 часов:
-- [antizapret](https://github.com/savely-krasovsky/antizapret-sing-box) — домены и IP, заблокированные в РФ
-- [geoip-ru](https://github.com/SagerNet/sing-geoip) — IP-адреса, принадлежащие российским сетям
+Geodata обновляется автоматически каждые 6 часов через cron (`update-geodata.sh`).
 
-Принудительное обновление: перезапустите sing-box (`make restart-russia`).
+Источник: [runetfreedom/russia-v2ray-rules-dat](https://github.com/runetfreedom/russia-v2ray-rules-dat)
+
+Принудительное обновление: `make update-geodata RUSSIA_IP=...`
 
 ## Устранение неполадок
 
 **Клиент не подключается:**
-- Проверьте, что порт 443 открыт на сервере России
-- Убедитесь, что `server_name` и `short_id` совпадают на сервере и клиенте
-- Проверьте логи: `make logs-russia`
+- Порт 443 открыт? `ss -tlnp | grep 443`
+- Xray работает? `docker logs vpnsmart-xray-russia`
+- Reality ключи совпадают? (public key в ссылке = от private key на сервере)
 
 **Заблокированные сайты не открываются:**
-- Проверьте туннель: `ping 10.10.0.2` с сервера России
-- Проверьте, что порт 51820/udp открыт на сервере Финляндии
-- Проверьте логи: `make logs-finland`
+- Туннель жив? `ping 10.10.0.2`
+- Policy routing? `ip rule show | grep fwmark` + `ip route show table 100`
+- AWG handshake? `awg show awg0`
 
-**Высокая задержка:**
-- Нормальная задержка для заблокированных сайтов: +20-40мс (Россия → Финляндия)
-- Для российских сайтов задержка должна быть минимальной
-
-**Интерфейс не eth0:**
-- На сервере Финляндии проверьте `ip a` и замените `eth0` в `wg0.conf` на правильное имя
+**Сервер недоступен после запуска AWG:**
+- Убедитесь что в awg0.conf России есть `Table = off`
+- Без этого awg-quick перехватывает весь трафик

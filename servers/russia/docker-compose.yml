@@ -1,19 +1,31 @@
 services:
-  sing-box:
-    image: ghcr.io/sagernet/sing-box:latest
-    container_name: vpnsmart-singbox-russia
-    command: ["run", "-c", "/etc/sing-box/config.json"]
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: vpnsmart-xray-russia
+    command: ['run', '-c', '/etc/xray/config.json']
+    network_mode: host
+    user: "0:0"
     cap_add:
       - NET_ADMIN
+      - NET_BIND_SERVICE
     volumes:
-      - ./sing-box/config.json:/etc/sing-box/config.json:ro
-      - singbox-data:/var/lib/sing-box
-    ports:
-      - "443:443/tcp"
-      - "443:443/udp"
-    sysctls:
-      - net.ipv4.ip_forward=1
+      - ./xray/config.json:/etc/xray/config.json:ro
+      - ./xray/geodata:/usr/share/xray:ro
+    environment:
+      - XRAY_LOCATION_ASSET=/usr/share/xray
+    restart: unless-stopped
+
+  bot:
+    build: ./bot
+    container_name: vpnsmart-bot
+    env_file: .env.bot
+    volumes:
+      - ./xray/config.json:/opt/vpnsmart/xray/config.json
+      - bot-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - xray
     restart: unless-stopped
 
 volumes:
-  singbox-data:
+  bot-data:

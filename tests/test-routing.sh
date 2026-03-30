@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # VPNSmart Routing Tests
-# Run these AFTER connecting to the VPN from a client device
-# or from the Russia server itself to verify routing logic
+# Run from the Russia server to verify routing logic
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,25 +29,20 @@ check() {
 echo -e "${YELLOW}=== VPNSmart Routing Tests ===${NC}"
 echo ""
 
-# Get expected IPs from env or arguments
 RUSSIA_IP="${RUSSIA_IP:-}"
-FINLAND_IP="${FINLAND_IP:-}"
+LATVIA_IP="${LATVIA_IP:-}"
 
-if [ -z "$RUSSIA_IP" ] || [ -z "$FINLAND_IP" ]; then
-    echo "Usage: RUSSIA_IP=x.x.x.x FINLAND_IP=y.y.y.y ./test-routing.sh"
-    echo "Set the public IPs of your Russia and Finland servers."
+if [ -z "$RUSSIA_IP" ] || [ -z "$LATVIA_IP" ]; then
+    echo "Usage: RUSSIA_IP=x.x.x.x LATVIA_IP=y.y.y.y ./test-routing.sh"
     exit 1
 fi
 
-echo -e "${YELLOW}Testing blocked sites (should go through Finland: $FINLAND_IP)...${NC}"
+echo -e "${YELLOW}Testing blocked sites (should be reachable via Latvia)...${NC}"
 
-# Test blocked sites — these should route through Finland
-BLOCKED_SITES=("linkedin.com" "instagram.com" "medium.com")
+BLOCKED_SITES=("linkedin.com" "instagram.com" "medium.com" "youtube.com")
 
 for site in "${BLOCKED_SITES[@]}"; do
     echo -n "  $site... "
-    EXIT_IP=$(curl -s --max-time 10 --connect-timeout 5 "https://ifconfig.me" --resolve "ifconfig.me:443:$(dig +short ifconfig.me | head -1)" 2>/dev/null || echo "TIMEOUT")
-    # More practical: just check if the site is reachable
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --connect-timeout 5 "https://$site" 2>/dev/null || echo "000")
     if [ "$HTTP_CODE" != "000" ]; then
         echo -e "${GREEN}reachable (HTTP $HTTP_CODE)${NC}"
@@ -60,9 +54,8 @@ for site in "${BLOCKED_SITES[@]}"; do
 done
 
 echo ""
-echo -e "${YELLOW}Testing Russian sites (should go direct through Russia)...${NC}"
+echo -e "${YELLOW}Testing Russian sites (should go direct)...${NC}"
 
-# Test Russian sites — these should go direct
 RU_SITES=("ya.ru" "vk.com" "mail.ru")
 
 for site in "${RU_SITES[@]}"; do
@@ -78,14 +71,32 @@ for site in "${RU_SITES[@]}"; do
 done
 
 echo ""
-echo -e "${YELLOW}Testing WireGuard tunnel connectivity...${NC}"
+echo -e "${YELLOW}Testing AmneziaWG tunnel connectivity...${NC}"
 
-# Test tunnel (run from Russia server)
 if ping -c 2 -W 3 10.10.0.2 &> /dev/null; then
-    echo -e "${GREEN}[PASS]${NC} WireGuard tunnel to Finland (10.10.0.2) is up"
+    echo -e "${GREEN}[PASS]${NC} AmneziaWG tunnel to Latvia (10.10.0.2) is up"
     PASS=$((PASS + 1))
 else
-    echo -e "${RED}[FAIL]${NC} WireGuard tunnel to Finland (10.10.0.2) is down"
+    echo -e "${RED}[FAIL]${NC} AmneziaWG tunnel to Latvia (10.10.0.2) is down"
+    FAIL=$((FAIL + 1))
+fi
+
+echo ""
+echo -e "${YELLOW}Testing policy routing...${NC}"
+
+if ip rule show | grep -q "fwmark"; then
+    echo -e "${GREEN}[PASS]${NC} fwmark policy rule exists"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}[FAIL]${NC} fwmark policy rule missing"
+    FAIL=$((FAIL + 1))
+fi
+
+if ip route show table 100 2>/dev/null | grep -q "awg0"; then
+    echo -e "${GREEN}[PASS]${NC} routing table 100 routes via awg0"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}[FAIL]${NC} routing table 100 not configured"
     FAIL=$((FAIL + 1))
 fi
 

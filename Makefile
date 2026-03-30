@@ -1,65 +1,52 @@
-.PHONY: keys deploy-finland deploy-russia add-client test help
+.PHONY: help deploy-latvia deploy-russia status restart-russia restart-latvia logs-russia logs-latvia update-geodata test
 
 RUSSIA_IP ?=
-FINLAND_IP ?=
+LATVIA_IP ?=
 RUSSIA_SSH ?= root@$(RUSSIA_IP)
-FINLAND_SSH ?= root@$(FINLAND_IP)
+LATVIA_SSH ?= root@$(LATVIA_IP)
+SSH_KEY ?= $(HOME)/.ssh/id_ed25519_vpnsmart
+SSH_OPTS = -i $(SSH_KEY)
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-keys: ## Generate all keys (requires sing-box and wg locally)
-	@bash servers/russia/scripts/generate-keys.sh
-
-deploy-finland: ## Deploy Finland server (FINLAND_IP=x.x.x.x)
-	@if [ -z "$(FINLAND_IP)" ]; then echo "Usage: make deploy-finland FINLAND_IP=x.x.x.x"; exit 1; fi
-	@echo "=== Deploying to Finland server $(FINLAND_IP) ==="
-	rsync -avz --exclude='.git' servers/finland/ $(FINLAND_SSH):/opt/vpnsmart/
-	ssh $(FINLAND_SSH) "chmod +x /opt/vpnsmart/scripts/setup.sh && /opt/vpnsmart/scripts/setup.sh"
-	ssh $(FINLAND_SSH) "cd /opt/vpnsmart && docker compose up -d"
-	@echo "=== Finland deployment complete ==="
+deploy-latvia: ## Deploy Latvia server (LATVIA_IP=x.x.x.x)
+	@if [ -z "$(LATVIA_IP)" ]; then echo "Usage: make deploy-latvia LATVIA_IP=x.x.x.x"; exit 1; fi
+	@echo "=== Deploying to Latvia server $(LATVIA_IP) ==="
+	rsync -avz servers/latvia/scripts/ $(LATVIA_SSH):/opt/vpnsmart/scripts/
+	ssh $(SSH_OPTS) $(LATVIA_SSH) "chmod +x /opt/vpnsmart/scripts/*.sh && /opt/vpnsmart/scripts/setup.sh"
+	@echo "=== Latvia deployment complete ==="
 
 deploy-russia: ## Deploy Russia server (RUSSIA_IP=x.x.x.x)
 	@if [ -z "$(RUSSIA_IP)" ]; then echo "Usage: make deploy-russia RUSSIA_IP=x.x.x.x"; exit 1; fi
 	@echo "=== Deploying to Russia server $(RUSSIA_IP) ==="
-	rsync -avz --exclude='.git' servers/russia/ $(RUSSIA_SSH):/opt/vpnsmart/
-	ssh $(RUSSIA_SSH) "chmod +x /opt/vpnsmart/scripts/*.sh && /opt/vpnsmart/scripts/setup.sh"
-	ssh $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose up -d"
+	rsync -avz --exclude='.git' --exclude='*.dat' servers/russia/ $(RUSSIA_SSH):/opt/vpnsmart/
+	ssh $(SSH_OPTS) $(RUSSIA_SSH) "chmod +x /opt/vpnsmart/scripts/*.sh && /opt/vpnsmart/scripts/setup.sh"
+	ssh $(SSH_OPTS) $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose up -d --build"
 	@echo "=== Russia deployment complete ==="
 
-add-client: ## Add a new client (NAME=xxx RUSSIA_IP=x.x.x.x PUBLIC_KEY=xxx SHORT_ID=xxx)
-	@if [ -z "$(NAME)" ]; then echo "Usage: make add-client NAME=my-phone RUSSIA_IP=x.x.x.x PUBLIC_KEY=xxx SHORT_ID=xxx"; exit 1; fi
-	@bash servers/russia/scripts/add-client.sh "$(NAME)" "$(RUSSIA_IP)" "$(PUBLIC_KEY)" "$(SHORT_ID)"
+restart-russia: ## Restart Xray on Russia server
+	ssh $(SSH_OPTS) $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose restart xray"
 
-client-config: ## Generate client config (SERVER_IP=x.x.x.x UUID=xxx PUBLIC_KEY=xxx SHORT_ID=xxx)
-	@bash clients/generate-client-config.sh \
-		--server-ip "$(SERVER_IP)" \
-		--uuid "$(UUID)" \
-		--public-key "$(PUBLIC_KEY)" \
-		--short-id "$(SHORT_ID)"
-
-test: ## Run routing tests (RUSSIA_IP=x.x.x.x FINLAND_IP=x.x.x.x)
-	@RUSSIA_IP=$(RUSSIA_IP) FINLAND_IP=$(FINLAND_IP) bash tests/test-routing.sh
-
-test-direct: ## Test direct routing to Russian sites
-	@bash tests/test-direct.sh
-
-restart-russia: ## Restart sing-box on Russia server
-	ssh $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose restart"
-
-restart-finland: ## Restart WireGuard on Finland server
-	ssh $(FINLAND_SSH) "cd /opt/vpnsmart && docker compose restart"
+restart-latvia: ## Restart AmneziaWG on Latvia server
+	ssh $(SSH_OPTS) $(LATVIA_SSH) "systemctl restart awg-quick@awg0"
 
 logs-russia: ## Show Russia server logs
-	ssh $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose logs -f --tail=50"
+	ssh $(SSH_OPTS) $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose logs -f --tail=50"
 
-logs-finland: ## Show Finland server logs
-	ssh $(FINLAND_SSH) "cd /opt/vpnsmart && docker compose logs -f --tail=50"
+logs-latvia: ## Show Latvia AWG status and journal
+	ssh $(SSH_OPTS) $(LATVIA_SSH) "awg show; echo '---'; journalctl -u awg-quick@awg0 --no-pager -n 20"
+
+update-geodata: ## Force update geodata on Russia server
+	ssh $(SSH_OPTS) $(RUSSIA_SSH) "/opt/vpnsmart/scripts/update-geodata.sh"
 
 status: ## Check status of both servers
 	@echo "=== Russia Server ==="
-	@ssh $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose ps" 2>/dev/null || echo "  Cannot connect to Russia server"
+	@ssh $(SSH_OPTS) $(RUSSIA_SSH) "cd /opt/vpnsmart && docker compose ps; echo '---'; awg show awg0 2>/dev/null || echo 'AWG not running'; echo '---'; ip rule show | grep fwmark || echo 'No fwmark rules'" 2>/dev/null || echo "  Cannot connect to Russia server"
 	@echo ""
-	@echo "=== Finland Server ==="
-	@ssh $(FINLAND_SSH) "cd /opt/vpnsmart && docker compose ps" 2>/dev/null || echo "  Cannot connect to Finland server"
+	@echo "=== Latvia Server ==="
+	@ssh $(SSH_OPTS) $(LATVIA_SSH) "awg show awg0 2>/dev/null || echo 'AWG not running'" 2>/dev/null || echo "  Cannot connect to Latvia server"
+
+test: ## Run routing tests (RUSSIA_IP=x.x.x.x LATVIA_IP=x.x.x.x)
+	@RUSSIA_IP=$(RUSSIA_IP) LATVIA_IP=$(LATVIA_IP) bash tests/test-routing.sh
