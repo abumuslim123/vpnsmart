@@ -7,6 +7,7 @@ set -euo pipefail
 GEODATA_DIR="/opt/vpnsmart/xray/geodata"
 BASE_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
 CONTAINER="vpnsmart-xray-russia"
+MIN_FILE_SIZE=100000  # 100KB minimum — valid geodata files are 20MB+
 
 mkdir -p "$GEODATA_DIR"
 
@@ -18,16 +19,22 @@ for local_name in "${!FILES[@]}"; do
     remote_name="${FILES[$local_name]}"
     TMP=$(mktemp)
     if curl -sSL -o "$TMP" "$BASE_URL/$remote_name"; then
-        file="$local_name"
-        if ! cmp -s "$TMP" "$GEODATA_DIR/$file" 2>/dev/null; then
-            mv "$TMP" "$GEODATA_DIR/$file"
+        # Verify downloaded file is not empty/corrupt
+        FILE_SIZE=$(stat -c%s "$TMP" 2>/dev/null || stat -f%z "$TMP" 2>/dev/null || echo "0")
+        if [ "$FILE_SIZE" -lt "$MIN_FILE_SIZE" ]; then
+            echo "Downloaded $remote_name is too small (${FILE_SIZE} bytes), skipping" >&2
+            rm -f "$TMP"
+            continue
+        fi
+        if ! cmp -s "$TMP" "$GEODATA_DIR/$local_name" 2>/dev/null; then
+            mv "$TMP" "$GEODATA_DIR/$local_name"
             UPDATED=true
         else
             rm -f "$TMP"
         fi
     else
         rm -f "$TMP"
-        echo "Failed to download $file" >&2
+        echo "Failed to download $remote_name" >&2
     fi
 done
 
